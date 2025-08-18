@@ -1,200 +1,191 @@
 # -*- coding: utf-8 -*-
 """
-文件名: generate_dataset.py
-描述: 调用仿真引擎，批量生成用于神经网络训练的数据集。
-      本脚本模拟一个【物理弱化】的电网，并只对【计算收敛】的样本进行分析。
+This script generates the final dataset for the thesis research. It uses the
+robust mv_oberrhein network and simulates a more challenging scenario where
+EV charging occurs during the day, overlapping with peak PV generation.
+
+**REVISION**: This version implements a "combination punch" strategy:
+1. EV charger power is increased to 22kW to enhance their impact.
+2. PV inverters are modeled with a power factor of 0.95 (absorbing reactive
+   power) to mitigate their overvoltage effect, creating a more balanced
+   and complex interaction between the two uncertainty sources.
 """
+import pandapower as pp
+import pandapower.networks as nw
+import numpy as np
 import pandas as pd
 from scipy.stats import qmc
-from pathlib import Path
+from tqdm import tqdm
+from copy import deepcopy
 import os
-from simulation_engine import SimulationEngine
-import math
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# --- 结果分析与绘图函数 ---
-def analyze_and_plot_results(df, results_dir):
+# --- Simulation Constants ---
+NUM_SAMPLES = 100
+TIMESTEPS = 24
+VM_MIN_PU = 0.95
+VM_MAX_PU = 1.05
+MAX_LINE_LOADING = 100.0
+
+# --- Uncertainty Ranges ---
+PV_PENETRATION_RANGE = [0.5, 1.8]
+EV_COUNT_RANGE = [50, 350]
+# **FIXED**: Increased single EV charger power to 22kW
+EV_CHARGER_KW = 22.0
+# **ADDED**: Power factor for PV inverters to simulate voltage support
+PV_POWER_FACTOR = 0.95
+
+
+def get_grid():
     """
-    分析【已收敛】的数据集，统计PV渗透率对电压安全的影响，并生成可视化散点图。
+    Loads the mv_oberrhein network.
     """
-    print("\n\n--- 结果分析与可视化 (仅限计算收敛的样本) ---")
+    net = nw.mv_oberrhein()
+    return net
+
+def create_profiles():
+    """
+    Creates normalized 24h load, PV, and EV profiles.
+    """
+    load_profile = np.array([
+        0.60, 0.55, 0.52, 0.50, 0.52, 0.55, 0.65, 0.75, 0.85, 0.90, 0.95, 1.00,
+        0.95, 0.90, 0.88, 0.88, 0.90, 1.00, 0.98, 0.95, 0.90, 0.80, 0.70, 0.60
+    ])
     
-    if df.empty:
-        print("⚠️ 数据集为空或所有样本均为计算不收敛，无法进行电压安全分析。")
-        return
-
-    # 1. 整体统计分析
-    safe_samples = df[df['label'] == 0]
-    unsafe_samples = df[df['label'] == 1]
-
-    if unsafe_samples.empty:
-        print("✅ 在所有计算收敛的样本中，未发现任何电压越限问题。")
-        return
-
-    avg_pv_safe = safe_samples['pv_penetration'].mean()
-    avg_pv_unsafe = unsafe_samples['pv_penetration'].mean()
+    pv_profile = np.array([
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.2, 0.4, 0.6, 0.8, 1.0,
+        0.9, 0.7, 0.5, 0.2, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    ])
     
-    print(f"📊 整体统计摘要:")
-    print(f"  - 安全样本的平均PV渗透率: {avg_pv_safe:.2f}")
-    print(f"  - 电压越限样本的平均PV渗透率: {avg_pv_unsafe:.2f}")
+    ev_profile = np.zeros(24)
+    ev_profile[11:15] = [0.8, 1.0, 1.0, 0.8]
 
-    # 2. 按PV渗透率区间进行详细统计
-    print("\n--- 按PV渗透率区间的电压安全影响分析 ---")
-    bins = [0.5, 2.0, 4.0, 6.0]
-    labels = ['0.5-2.0 (中)', '2.0-4.0 (高)', '4.0-6.0 (非常高)']
-    df['pv_range'] = pd.cut(df['pv_penetration'], bins=bins, labels=labels, right=False, include_lowest=True)
+    return load_profile, pv_profile, ev_profile
 
-    range_analysis = df.groupby('pv_range', observed=True).agg(
-        total_samples=('label', 'count'),
-        unsafe_samples=('label', 'sum')
-    ).reset_index()
 
-    range_analysis['unsafe_rate_%'] = np.where(
-        range_analysis['total_samples'] > 0,
-        (range_analysis['unsafe_samples'] / range_analysis['total_samples'] * 100),
-        0
-    ).round(2)
+def run_simulation_for_sample(base_net, profiles, pv_penetration, ev_count):
+    """
+    Runs a 24h time-series simulation for a single scenario using a manual loop.
+    """
+    net = deepcopy(base_net)
+    load_profile, pv_profile, ev_profile = profiles
 
-    print("PV渗透率区间对电压安全状态的影响:")
-    print(range_analysis.to_string(index=False))
-    print("\n  - 分析显示，随着PV渗透率区间的提高，电压越限的不安全率应呈现显著上升趋势。")
+    base_loads_p = net.load.p_mw.copy()
+    base_loads_q = net.load.q_mvar.copy()
 
-    # 3. 生成散点图
-    try:
-        plt.rcParams['font.sans-serif'] = ['SimHei']
-        plt.rcParams['axes.unicode_minus'] = False
-    except Exception as e:
-        print(f"无法设置中文字体'SimHei'，绘图可能出现乱码: {e}")
+    total_peak_load_mw = base_loads_p.sum()
+    total_pv_mw = pv_penetration * total_peak_load_mw
+    total_ev_load_mw = ev_count * (EV_CHARGER_KW / 1000.0)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # Add PV generators with reactive power control
+    load_buses = net.load.bus.unique()
+    new_pv_indices = []
+    base_pv_p = {}
+    base_pv_q = {} # Store base Q for PVs
+    if total_pv_mw > 0 and len(load_buses) > 0:
+        pv_per_bus_p = total_pv_mw / len(load_buses)
+        # **FIXED**: Calculate reactive power based on power factor
+        q_per_bus = pv_per_bus_p * np.tan(np.arccos(PV_POWER_FACTOR))
+        for bus_idx in load_buses:
+            idx = pp.create_sgen(net, bus=bus_idx, p_mw=pv_per_bus_p, q_mvar=q_per_bus, type='pv')
+            new_pv_indices.append(idx)
+            base_pv_p[idx] = pv_per_bus_p
+            base_pv_q[idx] = q_per_bus
     
-    colors = {0: 'green', 1: 'red'}
-    legend_labels = {0: '电压安全 (Safe)', 1: '电压越限 (Unsafe)'}
+    # Add EV loads
+    new_ev_load_indices = []
+    base_ev_p = {}
+    if total_ev_load_mw > 0 and len(load_buses) > 0:
+        ev_load_per_bus = total_ev_load_mw / len(load_buses)
+        for bus_idx in load_buses:
+            idx = pp.create_load(net, bus=bus_idx, p_mw=ev_load_per_bus, q_mvar=0, name=f"EVs_bus_{bus_idx}")
+            new_ev_load_indices.append(idx)
+            base_ev_p[idx] = ev_load_per_bus
 
-    sns.scatterplot(data=df, x='pv_penetration', y='load_multiplier', hue='label', 
-                    palette=colors, style='label', s=80, ax=ax)
+    # Manual simulation loop
+    for t in range(TIMESTEPS):
+        net.load.loc[base_loads_p.index, 'p_mw'] = base_loads_p * load_profile[t]
+        net.load.loc[base_loads_q.index, 'q_mvar'] = base_loads_q * load_profile[t]
+        
+        for idx in new_pv_indices:
+            # Scale both P and Q with the profile
+            net.sgen.loc[idx, 'p_mw'] = base_pv_p[idx] * pv_profile[t]
+            net.sgen.loc[idx, 'q_mvar'] = base_pv_q[idx] * pv_profile[t]
+        
+        for idx in new_ev_load_indices:
+            net.load.loc[idx, 'p_mw'] = base_ev_p[idx] * ev_profile[t]
+
+        try:
+            pp.runpp(net)
+        except Exception:
+            return 'unsafe_convergence'
+
+        if net.res_bus.vm_pu.min() < VM_MIN_PU or net.res_bus.vm_pu.max() > VM_MAX_PU:
+            return 'unsafe_voltage'
+        if not net.res_line.empty and net.res_line.loading_percent.max() > MAX_LINE_LOADING:
+            return 'unsafe_overload'
+
+    return 'safe'
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_filename = "dataset_daytime_charging_pf_control.csv"
+    output_path = os.path.join(script_dir, output_filename)
     
-    ax.set_title('电网电压安全边界 (物理弱化模型)\n(Voltage Security Boundary with Physically Weakened Grid)', fontsize=16)
-    ax.set_xlabel('光伏渗透率 (PV Penetration)', fontsize=12)
-    ax.set_ylabel('负荷乘数 (Load Multiplier)', fontsize=12)
+    print(f"--- Data Generation Script Started ---")
+    print(f"Scenario: Daytime EV Charging (22kW) & PV with PF Control")
+    print(f"Output will be saved to: {output_path}")
+
+    print("\n1. Initializing grid and parameters...")
+    net = get_grid()
+    print("   - Grid loaded: MV Oberrhein network")
+
+    print("\n2. Creating 24h load, PV, and EV profiles...")
+    profiles = create_profiles()
+    print("   - Profiles created successfully (Daytime EV charging).")
+
+    print("\n3. Generating samples using Latin Hypercube Sampling...")
+    sampler = qmc.LatinHypercube(d=2, seed=42)
+    samples = sampler.random(n=NUM_SAMPLES)
+
+    scaled_samples = qmc.scale(samples,
+                               [PV_PENETRATION_RANGE[0], EV_COUNT_RANGE[0]],
+                               [PV_PENETRATION_RANGE[1], EV_COUNT_RANGE[1]])
+    scaled_samples[:, 1] = np.round(scaled_samples[:, 1]).astype(int)
+    print(f"   - Generated {NUM_SAMPLES} samples.")
+
+    print("\n4. Running simulations for all samples...")
+    results = []
+    for i in tqdm(range(NUM_SAMPLES), desc="Simulating scenarios"):
+        pv_penetration = scaled_samples[i, 0]
+        ev_count = int(scaled_samples[i, 1])
+        
+        label = run_simulation_for_sample(net, profiles, pv_penetration, ev_count)
+        
+        results.append({
+            'pv_penetration': pv_penetration,
+            'ev_count': ev_count,
+            'label_reason': label,
+            'label': 0 if label == 'safe' else 1
+        })
+
+    print("\n--- Simulation complete ---")
     
-    handles, _ = ax.get_legend_handles_labels()
-    ax.legend(handles, [legend_labels[0], legend_labels[1]], title='场景标签 (Label)')
+    print("\n5. Saving dataset...")
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(output_path, index=False)
 
-    plot_path = results_dir / "safety_boundary_final.png"
-    fig.savefig(plot_path, dpi=300)
+    print(f"   - Dataset saved to {output_path}")
+    safe_count = (results_df.label == 0).sum()
+    unsafe_count = (results_df.label == 1).sum()
+    print(f"   - Safe samples (label=0): {safe_count}")
+    print(f"   - Unsafe samples (label=1): {unsafe_count}")
     
-    print(f"\n📈 可视化散点图已生成并保存到: '{plot_path}'")
-
-# --- 1. 定义采样空间和常量 ---
-NUM_SAMPLES = 500
-V_MIN = 0.95
-V_MAX = 1.05
-
-parameter_bounds = {
-    'pv_penetration': [0.5, 6.0],
-    'load_multiplier': [0.5, 1.2]
-}
-
-# --- 2. 使用LHS生成输入样本 ---
-l_bounds = [b[0] for b in parameter_bounds.values()]
-u_bounds = [b[1] for b in parameter_bounds.values()]
-
-sampler = qmc.LatinHypercube(d=len(parameter_bounds))
-sample_points = qmc.scale(sampler.random(n=NUM_SAMPLES), l_bounds, u_bounds)
-print(f"✅ 已使用LHS在2维空间中生成 {NUM_SAMPLES} 个采样点。")
-print(f"   采样范围: PV渗透率 [{parameter_bounds['pv_penetration'][0]}, {parameter_bounds['pv_penetration'][1]}], 负荷乘数 [{parameter_bounds['load_multiplier'][0]}, {parameter_bounds['load_multiplier'][1]}]")
+    if unsafe_count > 0:
+        print("\nFailure reason breakdown for unsafe samples:")
+        print(results_df[results_df.label == 1]['label_reason'].value_counts())
 
 
-# --- 3. 初始化仿真引擎 ---
-script_dir = Path(__file__).parent.resolve()
-dss_file = script_dir / "IEEE13_Master.dss"
-results_dir = script_dir / "results"
-engine = SimulationEngine(str(dss_file), str(results_dir))
-
-# --- 4. 循环运行仿真并生成数据集 ---
-dataset = []
-total_load_kw = 3465 
-unsafe_count = 0
-
-print("\n--- 开始仿真循环 (物理弱化电网 + 稳健求解器) ---")
-for i, point in enumerate(sample_points):
-    pv_penetration = point[0]
-    load_multiplier = point[1]
-
-    print(f"\r正在仿真场景 {i+1}/{NUM_SAMPLES}: PV Pen={pv_penetration:.2f}, Load Mult={load_multiplier:.2f}...", end="")
-
-    total_pv_pmpp = total_load_kw * pv_penetration
-    
-    scenario_config = {
-        'load_multiplier': load_multiplier,
-        'pv_systems': {
-            'PV_675': {'phases': 3, 'bus': '675', 'pmpp': total_pv_pmpp * 0.6, 'kVA': total_pv_pmpp * 0.6 * 1.1},
-            'PV_611': {'phases': 1, 'bus': '611', 'pmpp': total_pv_pmpp * 0.4, 'kVA': total_pv_pmpp * 0.4 * 1.1}
-        }
-    }
-
-    voltage_profiles, converged, reason = engine.run_24h_simulation(scenario_config)
-
-    # --- 5. 标记场景 ---
-    label = 0
-    is_unsafe = False
-    
-    if not converged:
-        label = -1 
-    elif not voltage_profiles:
-        is_unsafe = True
-    else:
-        for bus, df_v in voltage_profiles.items():
-            engine.dss_engine.ActiveCircuit.SetActiveBus(bus)
-            kv_base = engine.dss_engine.ActiveCircuit.ActiveBus.kVBase
-            if kv_base == 0: continue
-            
-            phase_base_voltage = (kv_base * 1000.0) / math.sqrt(3.0) if engine.dss_engine.ActiveCircuit.ActiveBus.NumNodes >= 3 else (kv_base * 1000.0)
-            
-            for col in df_v.columns:
-                if col.startswith('V') and 'Angle' not in col:
-                    if phase_base_voltage == 0: continue
-                    v_pu_series = df_v[col] / phase_base_voltage
-                    if not v_pu_series[(v_pu_series >= V_MIN) & (v_pu_series <= V_MAX)].all():
-                        is_unsafe = True
-                        break
-            if is_unsafe:
-                break
-    
-    if is_unsafe:
-        label = 1
-        unsafe_count += 1
-
-    dataset.append({
-        'pv_penetration': pv_penetration,
-        'load_multiplier': load_multiplier,
-        'label': label,
-        'unsafe_reason': reason 
-    })
-
-# --- 6. 保存并统计数据集 ---
-df = pd.DataFrame(dataset)
-csv_path = results_dir / "dataset_final_ultimate.csv"
-df.to_csv(csv_path, index=False)
-
-print(f"\n\n🎉 数据集生成完毕！ {NUM_SAMPLES} 个场景已仿真并保存到 '{csv_path}'。")
-print(f"   总共发现 {unsafe_count} 个电压越限样本。")
-print(f"   另有 {(df['label'] == -1).sum()} 个计算不收敛样本。")
-
-# --- 7. 创建一个只包含电压问题的“干净”数据集 ---
-df_clean = df[df['label'] != -1].copy()
-
-if not df_clean.empty:
-    clean_csv_path = results_dir / "dataset_clean_voltage_only_ultimate.csv"
-    df_clean.to_csv(clean_csv_path, index=False)
-    print(f"\n\n✅ 已创建只包含【计算收敛】样本的干净数据集，并保存到 '{clean_csv_path}'。")
-    print("\n--- 干净数据集统计 (安全 vs 电压越限) ---")
-    print(df_clean['label'].value_counts())
-else:
-    print("\n\n⚠️ 未能生成任何计算收敛的样本。")
-
-# --- 8. 调用分析与绘图功能，并传入【干净】的数据集 ---
-analyze_and_plot_results(df_clean, results_dir)
+if __name__ == '__main__':
+    main()
+    print("\n--- Data Generation Script Finished ---")
